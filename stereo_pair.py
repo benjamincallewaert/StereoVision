@@ -615,6 +615,7 @@ class CameraWorker:
         self._label: str | None = None
         self._prev_fid: int | None = None
         self.dropped = 0                  # triggers the camera produced but we missed
+        self.captured = 0                 # frames the camera actually delivered to us
 
         self.thread = threading.Thread(
             target=self._run,
@@ -626,6 +627,7 @@ class CameraWorker:
         """Route every subsequent frame to ``sink`` as ``(label, frame)``."""
         self._prev_fid = None
         self.dropped   = 0
+        self.captured  = 0
         self._label    = label
         self._sink     = sink            # set last: the read in _run is then valid
 
@@ -659,6 +661,7 @@ class CameraWorker:
 
             sink = self._sink
             if sink is not None:
+                self.captured += 1   # a frame the camera actually delivered
                 # Detect triggers the camera produced but we never retrieved
                 # (frame_id / BlockID increments once per trigger).
                 if frame.frame_id is not None and self._prev_fid is not None:

@@ -152,11 +152,15 @@ class SyncRig:
         camera_matrix:   np.ndarray | None = None,
         dist_coeffs:     np.ndarray | None = None,
         marker_length_m: float | None      = None,
-        # ── Wheel-camera vertical ROI (sensor-side crop) ────────────────────
-        # Crop the wheel camera to a horizontal band to cut its data rate.
-        # None = full frame.  offset None = centred vertically.
-        wheel_roi_height:   int | None = None,
-        wheel_roi_offset_y: int | None = None,
+        # ── Vertical ROI (sensor-side crop) ─────────────────────────────────
+        # Crop a camera to a horizontal band to cut its data rate AND raise its
+        # max frame rate (rows ↓ -> fps ↑).  None = full frame; offset None =
+        # centred.  The stereo pair is usually the dominant data source, so
+        # cropping it is what lets a fast trigger keep up.
+        wheel_roi_height:    int | None = None,
+        wheel_roi_offset_y:  int | None = None,
+        stereo_roi_height:   int | None = None,
+        stereo_roi_offset_y: int | None = None,
     ) -> None:
 
         # ── Shared VmbSystem context (required if any camera is Allied Vision) ──
@@ -172,10 +176,12 @@ class SyncRig:
         self._cam_l = _make_camera(
             serial_left,  type_left,  exposure_us, stereo_gain_db,
             use_external_trigger, trigger_source_left,  vmb=self._vmb,
+            roi_height=stereo_roi_height, roi_offset_y=stereo_roi_offset_y,
         )
         self._cam_r = _make_camera(
             serial_right, type_right, exposure_us, stereo_gain_db,
             use_external_trigger, trigger_source_right, vmb=self._vmb,
+            roi_height=stereo_roi_height, roi_offset_y=stereo_roi_offset_y,
         )
         self._cam_w = _make_camera(
             serial_wheel, type_wheel, exposure_us, wheel_gain_db,
@@ -459,23 +465,29 @@ class SyncRig:
 
         print(f"[SyncRig] Triggered capture — waiting for {num_frames} frames/camera "
               f"(format={ext}).")
+        workers = (self._worker_l, self._worker_r, self._worker_w)
         start_time    = time.time()
         last_progress = start_time
         last_min      = 0
         drain_start   = start_time
         try:
             while True:
-                with saved_lock:
-                    cur_min = min(saved.values())
+                # Progress is measured by frames the CAMERAS delivered (captured),
+                # not frames written — so a write backlog doesn't look like the
+                # trigger stopping.
+                cur_min = min(w.captured for w in workers)
                 if cur_min >= num_frames:
                     break
 
                 now = time.time()
                 if cur_min > last_min:
                     last_min, last_progress = cur_min, now
-                elif now - last_progress > idle_timeout_s:
+                elif now - last_progress > idle_timeout_s and work_q.empty():
+                    # No new frames delivered for idle_timeout_s AND nothing left
+                    # to write -> the trigger has genuinely stopped.  (If the
+                    # queue is non-empty we're just write-bound, not idle.)
                     print(f"[SyncRig] No new frames for {idle_timeout_s:.0f}s — "
-                          f"stopping (min saved={cur_min}).")
+                          f"stopping (captured={cur_min}).")
                     break
 
                 if show_preview:
@@ -506,18 +518,22 @@ class SyncRig:
             if show_preview:
                 cv2.destroyAllWindows()
 
-        elapsed  = max(time.time() - start_time, 1e-9)
+        elapsed   = max(time.time() - start_time, 1e-9)
         with saved_lock:
             total = dict(saved)
-        captured = min(total.values())
+        n_saved   = min(total.values())
+        delivered = min(w.captured for w in workers)
         print(
-            f"[SyncRig] Triggered done. Saved L={total['left']} R={total['right']} "
-            f"W={total['wheel']} | achieved {captured / elapsed:.1f} fps/camera | "
+            f"[SyncRig] Triggered done. "
+            f"Delivered (camera→us) L={self._worker_l.captured} "
+            f"R={self._worker_r.captured} W={self._worker_w.captured} | "
+            f"Saved L={total['left']} R={total['right']} W={total['wheel']} | "
+            f"achieved {delivered / elapsed:.1f} fps/camera | "
             f"dropped at camera (BlockID gaps): L={self._worker_l.dropped} "
             f"R={self._worker_r.dropped} W={self._worker_w.dropped} | "
             f"final write drain {time.time() - drain_start:.1f}s"
         )
-        return captured
+        return n_saved
 
     # ── Sequence capture + save ───────────────────────────────────────────────
 
@@ -530,6 +546,7 @@ class SyncRig:
         blocking:     bool = False,
         save_format:  str  = "png",
         log_every:    int  = 0,
+        idle_timeout_s: float = 10.0,
     ) -> int:
         """
         Capture num_frames synchronised trios at the requested fps.
@@ -596,6 +613,7 @@ class SyncRig:
         if blocking:
             return self._grab_sequence_triggered(
                 num_frames, save_dir, ext, imwrite_params, show_preview,
+                idle_timeout_s=idle_timeout_s,
             )
 
         # ── Backpressure: cap RAM usage regardless of disk speed ──────────────
@@ -790,6 +808,21 @@ if __name__ == "__main__":
              "data rate so capture keeps up with a fast trigger."
     )
     parser.add_argument(
+        "--stereo-roi-height",
+        type=int,
+        default=None,
+        help="Vertical ROI height in px for BOTH stereo cameras (full width, "
+             "centred). The stereo pair is the dominant data source, so this is "
+             "usually what unblocks a fast trigger. Omit for full frame."
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=10.0,
+        help="Stop after this many seconds with no new frames delivered (and the "
+             "write queue drained). Raise it if your trigger is slow or bursty."
+    )
+    parser.add_argument(
         "--save-format",
         default="png",
         choices=["png", "jpg", "jpeg", "bmp", "tiff"],
@@ -824,7 +857,9 @@ if __name__ == "__main__":
     SHOW_PREVIEW = False
     SAVE_FORMAT  = args.save_format
     LOG_EVERY    = 0
-    WHEEL_ROI_HEIGHT = args.wheel_roi_height   # None = full frame
+    WHEEL_ROI_HEIGHT  = args.wheel_roi_height    # None = full frame
+    STEREO_ROI_HEIGHT = args.stereo_roi_height   # None = full frame
+    IDLE_TIMEOUT_S    = args.idle_timeout
 
     BLOCKING_GRAB = USE_HW_TRIGGER
 
@@ -843,6 +878,7 @@ if __name__ == "__main__":
         trigger_source_wheel=TRIGGER_LINE_WHEEL,
 
         wheel_roi_height=WHEEL_ROI_HEIGHT,
+        stereo_roi_height=STEREO_ROI_HEIGHT,
     ) as rig:
 
         rig.grab_sequence(
@@ -853,6 +889,7 @@ if __name__ == "__main__":
             blocking=BLOCKING_GRAB,
             save_format=SAVE_FORMAT,
             log_every=LOG_EVERY,
+            idle_timeout_s=IDLE_TIMEOUT_S,
         )
 
     os._exit(0)
