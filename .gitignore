@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / tooling
+.claude/
+
+# Captured image data & sessions (large, regenerable)
+sync_capture/
+old_sync_capture/
+captures/
+aruco_wheel/
+output/
+results/
+calibrations/
+charuco_boards/
+
+# Generated arrays / outputs
+*.npy
+*.npz
+matches.json
