@@ -26,7 +26,7 @@ except Exception:
 # Output format presets
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _format_to_ext_params(fmt: str) -> tuple[str, list[int]]:
+def _format_to_ext_params(fmt: str, jpeg_quality: int = 95) -> tuple[str, list[int]]:
     """
     Map a short format name to (file_extension, cv2.imwrite params).
 
@@ -34,8 +34,8 @@ def _format_to_ext_params(fmt: str) -> tuple[str, list[int]]:
       - "png"  : lossless, but PNG encoding is CPU-heavy.  Compression level 1
                  is the fastest *lossless* option OpenCV offers.
       - "jpg"  : ~5-10x faster to encode and ~10x smaller on disk, but lossy.
-                 Fine for the ArUco/wheel camera; think twice for the stereo
-                 measurement pair if you need sub-pixel accuracy.
+                 Lower jpeg_quality => faster encode + smaller files => higher
+                 sustainable fps (q85-90 is usually visually fine for this rig).
       - "bmp"  : essentially zero encoding cost, but huge files -> disk-bandwidth
                  bound.  Good when the SSD is fast and CPU is the bottleneck.
     """
@@ -43,12 +43,31 @@ def _format_to_ext_params(fmt: str) -> tuple[str, list[int]]:
     if fmt == "png":
         return ".png", [cv2.IMWRITE_PNG_COMPRESSION, 1]
     if fmt in ("jpg", "jpeg"):
-        return ".jpg", [cv2.IMWRITE_JPEG_QUALITY, 95]
+        return ".jpg", [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)]
     if fmt == "bmp":
         return ".bmp", []
     if fmt in ("tif", "tiff"):
         return ".tiff", []
-    raise ValueError(f"Unknown save_format {fmt!r} (use png/jpg/bmp/tiff)")
+    if fmt in ("npy", "raw"):
+        return ".npy", []   # uncompressed dump (np.save); for raw Bayer capture
+    raise ValueError(f"Unknown save_format {fmt!r} (use png/jpg/bmp/tiff/npy)")
+
+
+def _write_image(path: str, img: np.ndarray, ext: str, imwrite_params: list[int]) -> bool:
+    """Write one image, choosing np.save for .npy and cv2.imwrite otherwise."""
+    if ext == ".npy":
+        np.save(path, img)      # path already ends in .npy
+        return True
+    return bool(cv2.imwrite(path, img, imwrite_params))
+
+
+def _preview_bgr(img: np.ndarray, raw_bayer: bool) -> np.ndarray:
+    """Make a displayable BGR image (handles thermal uint16 and raw Bayer)."""
+    if img.dtype == np.uint16:
+        return thermal_to_bgr(img)
+    if raw_bayer and img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_BayerRG2BGR)
+    return img
 
 from stereo_pair import (
     CameraType,
@@ -161,7 +180,15 @@ class SyncRig:
         wheel_roi_offset_y:  int | None = None,
         stereo_roi_height:   int | None = None,
         stereo_roi_offset_y: int | None = None,
+        # ── Raw Bayer capture (Basler) ──────────────────────────────────────
+        # Skip the host demosaic: capture the single-channel Bayer mosaic and
+        # debayer offline (demosaic_raw.py).  Saves grab-thread CPU + RAM; does
+        # NOT reduce USB bandwidth (the wire is already Bayer).  Use a lossless
+        # save format (npy/png) — JPEG corrupts the mosaic.
+        raw_bayer: bool = False,
     ) -> None:
+
+        self._raw_bayer = raw_bayer
 
         # ── Shared VmbSystem context (required if any camera is Allied Vision) ──
         self._vmb = None
@@ -177,16 +204,19 @@ class SyncRig:
             serial_left,  type_left,  exposure_us, stereo_gain_db,
             use_external_trigger, trigger_source_left,  vmb=self._vmb,
             roi_height=stereo_roi_height, roi_offset_y=stereo_roi_offset_y,
+            raw=raw_bayer,
         )
         self._cam_r = _make_camera(
             serial_right, type_right, exposure_us, stereo_gain_db,
             use_external_trigger, trigger_source_right, vmb=self._vmb,
             roi_height=stereo_roi_height, roi_offset_y=stereo_roi_offset_y,
+            raw=raw_bayer,
         )
         self._cam_w = _make_camera(
             serial_wheel, type_wheel, exposure_us, wheel_gain_db,
             use_external_trigger, trigger_source_wheel, vmb=self._vmb,
             roi_height=wheel_roi_height, roi_offset_y=wheel_roi_offset_y,
+            raw=raw_bayer,
         )
 
         # ── Background grab workers (one per camera) ──────────────────────────
@@ -360,22 +390,18 @@ class SyncRig:
                     ("right", trio.right.image),
                     ("wheel", trio.wheel.image),
                 ):
-                    ok = cv2.imwrite(
+                    ok = _write_image(
                         str(save_dir / sub / f"{sub}_{idx:04d}{ext}"),
-                        img,
-                        imwrite_params,
+                        img, ext, imwrite_params,
                     )
                     if not ok:
-                        print(f"[WARN] Frame {idx:04d}: cv2.imwrite failed for {sub}")
+                        print(f"[WARN] Frame {idx:04d}: write failed for {sub}")
 
             if show_preview:
-                def _to_bgr(img: np.ndarray) -> np.ndarray:
-                    return thermal_to_bgr(img) if img.dtype == np.uint16 else img
-
                 pl, pr, pw = (
-                    _to_bgr(trio.left.image),
-                    _to_bgr(trio.right.image),
-                    _to_bgr(trio.wheel.image),
+                    _preview_bgr(trio.left.image,  self._raw_bayer),
+                    _preview_bgr(trio.right.image, self._raw_bayer),
+                    _preview_bgr(trio.wheel.image, self._raw_bayer),
                 )
                 with preview_lock:
                     preview_images["left"]  = pl
@@ -442,10 +468,10 @@ class SyncRig:
                             with saved_lock:
                                 idx = fallback[label]; fallback[label] += 1
                             name = f"{label}_{idx:06d}{ext}"
-                        ok = cv2.imwrite(str(save_dir / label / name),
-                                         frame.image, imwrite_params)
+                        ok = _write_image(str(save_dir / label / name),
+                                          frame.image, ext, imwrite_params)
                         if not ok:
-                            print(f"[WARN] imwrite failed: {label} id={frame.frame_id}")
+                            print(f"[WARN] write failed: {label} id={frame.frame_id}")
                     with saved_lock:
                         saved[label] += 1
                 finally:
@@ -496,8 +522,7 @@ class SyncRig:
                                      ("Wheel", self._worker_w)):
                         f = w.get_latest()
                         if f is not None:
-                            img = thermal_to_bgr(f.image) if f.image.dtype == np.uint16 else f.image
-                            cv2.imshow(title, img)
+                            cv2.imshow(title, _preview_bgr(f.image, self._raw_bayer))
                     if cv2.waitKey(1) != -1:
                         print("[SyncRig] Keypress — stopping early.")
                         break
@@ -547,6 +572,7 @@ class SyncRig:
         save_format:  str  = "png",
         log_every:    int  = 0,
         idle_timeout_s: float = 10.0,
+        jpeg_quality: int  = 95,
     ) -> int:
         """
         Capture num_frames synchronised trios at the requested fps.
@@ -593,7 +619,11 @@ class SyncRig:
         """
         period  = 1.0 / fps
         grab_fn = self.grab_sync_blocking if blocking else self.grab_sync
-        ext, imwrite_params = _format_to_ext_params(save_format)
+        ext, imwrite_params = _format_to_ext_params(save_format, jpeg_quality)
+        if self._raw_bayer and ext in (".jpg", ".jpeg"):
+            print("[SyncRig] raw Bayer + JPEG would corrupt the mosaic — "
+                  "saving .npy instead (demosaic offline).")
+            ext, imwrite_params = _format_to_ext_params("npy")
 
         # ── Create output directories ─────────────────────────────────────────
         if save_dir is not None:
@@ -783,7 +813,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--exposure",
         type=float,
-        default=2000,
+        default=200,
         help="Exposure time in microseconds"
     )
 
@@ -823,10 +853,24 @@ if __name__ == "__main__":
              "write queue drained). Raise it if your trigger is slow or bursty."
     )
     parser.add_argument(
+        "--raw-bayer",
+        action="store_true",
+        help="Capture the raw Bayer mosaic (no host demosaic) and save .npy; "
+             "demosaic offline with demosaic_raw.py. Lowers grab-thread CPU and "
+             "RAM (does NOT reduce USB bandwidth). Forces a lossless save."
+    )
+    parser.add_argument(
         "--save-format",
         default="png",
         choices=["png", "jpg", "jpeg", "bmp", "tiff"],
         help="Image format. 'jpg' is ~5-10x faster to write than 'png'."
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=95,
+        help="JPEG quality (1-100) when --save-format jpg. Lower = faster + "
+             "smaller = higher sustainable fps. 85-90 is usually fine."
     )
     parser.add_argument(
         "--num-frames",
@@ -856,10 +900,12 @@ if __name__ == "__main__":
     SAVE_DIR     = Path(f"sync_capture/{TEST}")
     SHOW_PREVIEW = False
     SAVE_FORMAT  = args.save_format
+    JPEG_QUALITY = args.jpeg_quality
     LOG_EVERY    = 0
     WHEEL_ROI_HEIGHT  = args.wheel_roi_height    # None = full frame
     STEREO_ROI_HEIGHT = args.stereo_roi_height   # None = full frame
     IDLE_TIMEOUT_S    = args.idle_timeout
+    RAW_BAYER         = args.raw_bayer
 
     BLOCKING_GRAB = USE_HW_TRIGGER
 
@@ -879,6 +925,7 @@ if __name__ == "__main__":
 
         wheel_roi_height=WHEEL_ROI_HEIGHT,
         stereo_roi_height=STEREO_ROI_HEIGHT,
+        raw_bayer=RAW_BAYER,
     ) as rig:
 
         rig.grab_sequence(
@@ -890,6 +937,7 @@ if __name__ == "__main__":
             save_format=SAVE_FORMAT,
             log_every=LOG_EVERY,
             idle_timeout_s=IDLE_TIMEOUT_S,
+            jpeg_quality=JPEG_QUALITY,
         )
 
     os._exit(0)

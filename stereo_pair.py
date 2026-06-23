@@ -119,7 +119,14 @@ class BaslerCamera(CameraBase):
         trigger_source: str = "Line1",
         roi_height: int | None = None,
         roi_offset_y: int | None = None,
+        raw: bool = False,
     ) -> None:
+
+        # raw=True: skip host demosaic and return the single-channel Bayer mosaic
+        # (camera default PixelFormat is BayerBG8).  Saves the per-frame debayer
+        # cost on the grab thread and 2/3 of the RAM per frame.  Demosaic offline
+        # with demosaic_raw.py (cv2.COLOR_BayerRG2BGR for this sensor).
+        self._raw = raw
 
         tlf     = pylon.TlFactory.GetInstance()
         devices = tlf.EnumerateDevices()
@@ -224,13 +231,18 @@ class BaslerCamera(CameraBase):
 
     def grab(self) -> CameraFrame | None:
 
-        timeout_ms = 5_000 if self._use_external_trigger else 500
-
+        # Short timeout + non-throwing return: RetrieveResult returns a ready
+        # frame *immediately* regardless of the timeout, so capture throughput is
+        # unaffected.  The short timeout only bounds how long we block when NO
+        # frame is available — which is what lets CameraWorker notice a stop
+        # request promptly instead of hanging ~5 s per camera at shutdown.
         result = self._cam.RetrieveResult(
-            timeout_ms,
-            self._pylon.TimeoutHandling_ThrowException
+            500,
+            self._pylon.TimeoutHandling_Return
         )
 
+        if result is None:
+            return None
         if not result.GrabSucceeded():
             result.Release()
             return None
@@ -243,10 +255,13 @@ class BaslerCamera(CameraBase):
         except Exception:
             pass
 
-        # ── Convert to proper BGR image ─────────────────────────
-        converted = self._converter.Convert(result)
-
-        arr = converted.GetArray().copy()
+        if self._raw:
+            # Single-channel Bayer mosaic, no host demosaic.
+            arr = result.GetArray().copy()
+        else:
+            # ── Convert to proper BGR image ─────────────────────────
+            converted = self._converter.Convert(result)
+            arr = converted.GetArray().copy()
 
         result.Release()
 
@@ -549,11 +564,13 @@ def _make_camera(
     vmb=None,
     roi_height: int | None = None,
     roi_offset_y: int | None = None,
+    raw: bool = False,
 ) -> CameraBase:
     """Create the appropriate CameraBase subclass.
 
     roi_height / roi_offset_y apply a sensor-side vertical crop (Basler only for
-    now); pass None for the full frame.
+    now); pass None for the full frame.  raw=True returns the Bayer mosaic
+    (Basler only); demosaic offline.
     """
     if cam_type == CameraType.BASLER:
         return BaslerCamera(
@@ -562,6 +579,7 @@ def _make_camera(
             use_external_trigger=use_external_trigger,
             trigger_source=trigger_source,
             roi_height=roi_height, roi_offset_y=roi_offset_y,
+            raw=raw,
         )
     elif cam_type == CameraType.ALLIED_VISION:
         if vmb is None:
