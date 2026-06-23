@@ -603,7 +603,7 @@ class SyncRig:
             print(f"[SyncRig] Saving to: {save_dir.resolve()}  (format={ext})")
 
         # ── Warmup: wait for all cameras to deliver their first frame ─────────
-        self._warmup(timeout_s=5.0)
+        self._warmup(timeout_s=500.0)
         time.sleep(1.0)
 
         # ── Hardware-trigger path: lossless queue pipeline (Tier 3) ───────────
