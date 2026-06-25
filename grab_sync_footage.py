@@ -820,13 +820,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gain",
         type=float,
-        default=10,
+        default=4,
         help="Gain in dB"
     )
     parser.add_argument(
         "--wheel-gain",
         type=float,
-        default=4,
+        default=3,
         help="Gain in dB for wheel camera"
     )
     parser.add_argument(
@@ -861,7 +861,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--save-format",
-        default="png",
+        default="jpg",
         choices=["png", "jpg", "jpeg", "bmp", "tiff"],
         help="Image format. 'jpg' is ~5-10x faster to write than 'png'."
     )
